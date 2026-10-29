@@ -1,0 +1,1954 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<meta name="description" content="躲开下落的方块，把方块上的数字打碎得分。3 条命、武器升级、每 30 秒一个金色奖励目标。" />
+<meta name="theme-color" content="#0b0f14" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta property="og:type" content="website" />
+<meta property="og:title" content="危险方块 · 打方块得分的网页小游戏" />
+<meta property="og:description" content="WASD 移动、按住射击，躲开红色危险物。3 条命，能升级武器。" />
+<title>危险方块 · 打方块得分的网页小游戏</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    overscroll-behavior: none;          /* 关掉 iOS 的橡皮筋回弹 */
+    background: #0b0f14;
+    color: #e8eef7;
+    font-family: ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+    -webkit-tap-highlight-color: transparent;
+    -webkit-touch-callout: none;        /* 长按不弹「保存图片」 */
+    -webkit-user-select: none;
+    user-select: none;
+    touch-action: none;                 /* 手指拖动交给游戏，不滚动页面 */
+  }
+  body {
+    position: fixed;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    /* 刘海屏 / 底部横条留白 */
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+  #wrap {
+    position: relative;
+    width: min(94vw, 560px);
+    height: min(88vh, 747px);
+    height: min(88dvh, 747px);          /* 新版浏览器用 dvh，地址栏收起不会跳 */
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+    border-radius: 18px;
+    background: #0f141b;
+    box-shadow: 0 0 0 1px #222b36, 0 30px 70px rgba(0, 0, 0, .55);
+    touch-action: none;
+    cursor: crosshair;
+  }
+  /* 手机横屏时提示竖过来（横屏太扁，方块几乎没时间反应） */
+  #rotate {
+    display: none;
+  }
+  @media (orientation: landscape) and (max-height: 520px) {
+    #rotate {
+      display: grid;
+      position: fixed;
+      inset: 0;
+      place-items: center;
+      background: #0b0f14;
+      color: #8b98a9;
+      font-size: 15px;
+      text-align: center;
+      line-height: 1.8;
+      z-index: 10;
+    }
+  }
+</style>
+</head>
+<body>
+  <div id="wrap">
+    <canvas id="game"></canvas>
+  </div>
+  <div id="rotate">请把手机竖过来玩<br />竖屏才躲得开</div>
+
+<script>
+/* =========================================================
+   危险方块 · 射击版
+   规则：
+     - 方块从天而降，活越久掉得越快
+     - 全屏自由移动，按住空格 / 鼠标向上射击
+     - 打掉方块得「方块上的数字」那么多分（1~100）
+     - 红色危险物打不掉，只能躲；碰到掉一条命（共 3 条）
+     - 每 30 秒出现一次金色奖励目标，打掉 +20
+   ========================================================= */
+
+// ---------------- 1. 小工具 ----------------
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+// 轴对齐矩形碰撞（AABB）
+const overlaps = (a, b) =>
+  a.x < b.x + b.w && a.x + a.w > b.x &&
+  a.y < b.y + b.h && a.y + a.h > b.y;
+
+// ---------------- 2. 可调参数 ----------------
+const CFG = {
+  lives: 3,             // 生命数
+  invulnTime: 1.6,      // 受伤后的无敌时间（秒）
+  playerSpeed: 540,     // 移动速度（px/秒）
+  bulletSpeed: 1000,    // 子弹速度
+  fireCooldown: 0.12,   // 射击间隔（秒）
+  spawnStart: 0.90,     // 开局生成间隔
+  spawnDecay: 0.005,    // 每过 1 秒缩短多少
+  spawnMin: 0.30,       // 生成间隔下限
+  speedCap: 2.6,        // 下落速度倍率上限（越活越快，最多到 2.6 倍）
+  bonusInterval: 30,    // 奖励目标第一次出现的间隔（秒）
+  bonusStep: 10,        // 每出现一次，下一次就再晚这么多秒
+  bonusHp: 5,
+  bonusScore: 20,
+  hazardChance: 0.22,   // 危险物（打不掉的红色家伙）出现概率上限
+  scoreStartMax: 30,      // 前期分值上限
+  scoreMax: 100,          // 后期分值上限
+  scoreRampDelay: 30,     // 前多少秒维持 1~30
+  scoreRamp: 120,         // 之后用多少秒从 30 过渡到 100
+  bigBlockMin: 50,        // 多少分以上进入“大块”规则
+  bigBlockStep: 10,       // 大块每次被普通攻击扣多少耐久
+  armorStartChance: 0.05, // 护甲方块初始出现概率
+  armorMaxChance: 0.60,   // 护甲方块出现概率上限
+  armorRamp: 120,         // 多少秒后达到上限
+  armorMin: 0.10,         // 最低免伤 10%
+  armorMax: 0.30,         // 最高免伤 30%
+  crisisFirstCheck: 15,   // 第一次检查危机模式的秒数
+  crisisCheckGap: 15,     // 之后每隔多少秒检查一次
+  crisisDuration: 10,     // 单次危机持续秒数
+  crisisChanceMin: 0.10,  // 危机触发概率下限
+  crisisChanceMax: 0.30,  // 危机触发概率上限
+  crisisChanceRamp: 120,  // 多少秒后达到概率上限
+  crisisBombChance: 0.55, // 危机波次里出炸弹的概率
+  crisisHealChance: 0.18, // 危机波次里出回血模块的概率
+  healModuleChance: 0.06, // 普通模式回血模块出现概率
+  upgradeFirst: 10,     // 武器升级第一次出现的秒数
+  upgradeStep: 5,       // 之后每一次间隔再 +5 秒
+};
+
+// 调试用：地址后面加 ?bonus=5 就能把奖励间隔临时改成 5 秒，方便反复看效果
+try {
+  const v = parseFloat(new URLSearchParams(location.search).get('bonus'));
+  if (v > 0) CFG.bonusInterval = v;
+} catch { /* 拿不到 location 就用默认值 */ }
+
+// ---------------- 3. 画布 ----------------
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+const COLOR = {
+  bg: '#0f141b',
+  grid: 'rgba(255, 255, 255, 0.035)',
+  player: '#37e0c2',
+  playerGlow: 'rgba(55, 224, 194, 0.45)',
+  bullet: '#b9f6ff',
+  bulletGlow: 'rgba(150, 240, 255, 0.8)',
+  gold: '#ffd93d',
+  hazard: '#ff4d5e',
+  text: '#e8eef7',
+  dim: '#8b98a9',
+};
+
+let W = 0, H = 0;
+let dpr = 1;
+
+// ---------------- 4. 状态 ----------------
+const state = { READY: 0, PLAYING: 1, PAUSED: 2, OVER: 3, UPGRADE: 4 };
+let phase = state.READY;
+
+// ---------------- 4.5 武器升级 ----------------
+// 特殊攻击：升级提高触发概率；每次开火按概率触发
+const SPECIALS = {
+  laser:    { name: '激光', damage: 15, chance: [0.02, 0.03, 0.04, 0.05, 0.06], color: '#66e0ff', desc: '穿透 · 伤害 15' },
+  fireball: { name: '火球', damage: 10, chance: [0.03, 0.04, 0.05, 0.06, 0.07], color: '#ff8c42', desc: '爆炸 · 伤害 10' },
+  cannon:   { name: '炮弹', damage: 5,  chance: [0.04, 0.05, 0.06, 0.07, 0.08], color: '#ffd166', desc: '重击 · 伤害 5' },
+  recovery: { name: '恢复光束', short: '恢复', damage: 0, chance: [0.10, 0.15, 0.20], color: '#7dffb2', desc: '恢复 1 血', heal: true },
+};
+const SPECIAL_ORDER = ['laser', 'fireball', 'cannon', 'recovery'];
+
+// values[等级 - 1]：等级 1 就是初始值，升级只往上加，不花分
+const UPGRADES = {
+  rate: { name: '射速', max: 10, values: [0.120, 0.112, 0.104, 0.097, 0.090, 0.084, 0.078, 0.073, 0.068, 0.063] },  // 射击间隔
+  shot: { name: '弹道', max: 10, values: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] },                                            // 每次几颗子弹
+  move: { name: '移速', max: 10, values: [540, 580, 620, 660, 700, 740, 780, 820, 860, 900] },                        // 移动速度
+  laser: { name: '激光', max: 5, special: true },
+  fireball: { name: '火球', max: 5, special: true },
+  cannon: { name: '炮弹', max: 5, special: true },
+  recovery: { name: '恢复光束', max: 3, special: true },
+};
+const UPGRADE_ORDER = ['rate', 'shot', 'move', 'laser', 'fireball', 'cannon', 'recovery'];
+
+const upgrades = { rate: 1, shot: 1, move: 1, laser: 0, fireball: 0, cannon: 0, recovery: 0 };
+let upgradeGap = CFG.upgradeFirst;          // 当前升级间隔，每次 +5 秒
+let nextUpgradeAt = CFG.upgradeFirst;       // 下一次升级出现的时刻
+let upgradeOptions = [];                    // 本次给出的卡片（1~3 张，随机）
+let maxedNotified = false;                  // 全满级提示是否已经弹过
+
+function upValue(key) {
+  const u = UPGRADES[key];
+  return u.values[Math.min(upgrades[key], u.max) - 1];
+}
+const fireRate = () => upValue('rate');
+const bulletCount = () => upValue('shot');
+const moveSpeed = () => upValue('move');
+const allMaxed = () => UPGRADE_ORDER.every((k) => upgrades[k] >= UPGRADES[k].max);
+
+// ---------------- 5. 游戏数据 ----------------
+const player = { x: 0, y: 0, w: 46, h: 46 };
+
+let blocks = [];       // 下落物 { x, y, w, h, vy, value, hp, flash, armor, guard, bomb, haz }
+let bullets = [];
+let beams = [];        // 激光光束残留
+let particles = [];
+let popups = [];
+let bonusTarget = null;
+let banner = null;
+
+let score = 0;
+let comboHits = 0;        // 这一串连击打了几个
+let comboTimer = 0;       // 连击剩余时间，归零就断
+const COMBO_WINDOW = 2.0; // 2 秒内再打死一个才算接上
+const COMBO_MAX = 4;      // 倍率上限 ×4
+let lives = CFG.lives;
+let elapsed = 0;
+let invuln = 0;        // 无敌剩余时间
+let shake = 0;         // 屏幕抖动强度
+let flashRed = 0;      // 受伤红屏
+let spawnTimer = 0;
+let fireTimer = 0;
+let nextBonusAt = CFG.bonusInterval;
+let bonusGap = CFG.bonusInterval;   // 当前的奖励间隔，每出现一次就 +10 秒
+
+// 危机模式：每隔一段时间检查一次，存活越久触发概率越高
+const crisis = {
+  active: false,
+  endAt: 0,
+  nextCheckAt: CFG.crisisFirstCheck,
+  chance: CFG.crisisChanceMin,
+};
+
+let best = loadBest();
+let muted = loadMuted();
+
+function loadBest() {
+  try { return parseInt(localStorage.getItem('danger-shooter-best'), 10) || 0; } catch { return 0; }
+}
+function saveBest(v) {
+  try { localStorage.setItem('danger-shooter-best', String(v)); } catch { /* 忽略 */ }
+}
+function loadMuted() {
+  try { return localStorage.getItem('danger-shooter-muted') === '1'; } catch { return false; }
+}
+function saveMuted(v) {
+  try { localStorage.setItem('danger-shooter-muted', v ? '1' : '0'); } catch { /* 忽略 */ }
+}
+
+// ---------------- 6. 声音（全部用 WebAudio 现场合成，不需要音频文件） ----------------
+let actx = null;
+
+function ensureAudio() {
+  if (!actx) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return null;
+    try { actx = new AC(); } catch { return null; }
+  }
+  // 浏览器要求「用户点过页面」才能出声，所以每次发声前顺手恢复一下
+  if (actx.state === 'suspended') actx.resume();
+  return actx;
+}
+
+function tone({ f, f2 = 0, dur = 0.1, type = 'square', vol = 0.06, delay = 0 }) {
+  if (muted) return;
+  const ac = ensureAudio();
+  if (!ac) return;
+  const t0 = ac.currentTime + delay;
+  const osc = ac.createOscillator();
+  const g = ac.createGain();
+  osc.type = type;
+  osc.frequency.setValueAtTime(f, t0);
+  if (f2 > 0) osc.frequency.exponentialRampToValueAtTime(Math.max(20, f2), t0 + dur);
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.exponentialRampToValueAtTime(vol, t0 + 0.006);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  osc.connect(g);
+  g.connect(ac.destination);
+  osc.start(t0);
+  osc.stop(t0 + dur + 0.03);
+}
+
+function noise({ dur = 0.12, vol = 0.05, freq = 1200, delay = 0 }) {
+  if (muted) return;
+  const ac = ensureAudio();
+  if (!ac) return;
+  const len = Math.max(1, Math.floor(ac.sampleRate * dur));
+  const buf = ac.createBuffer(1, len, ac.sampleRate);
+  const data = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / len);
+
+  const src = ac.createBufferSource();
+  const bp = ac.createBiquadFilter();
+  const g = ac.createGain();
+  src.buffer = buf;
+  bp.type = 'bandpass';
+  bp.frequency.value = freq;
+  bp.Q.value = 0.7;
+  g.gain.value = vol;
+  src.connect(bp);
+  bp.connect(g);
+  g.connect(ac.destination);
+  src.start(ac.currentTime + delay);
+}
+
+const SFX = {
+  shoot()  { tone({ f: 900, f2: 620, dur: 0.045, vol: 0.016 }); },
+  hit()    { tone({ f: 460, f2: 300, dur: 0.05, vol: 0.045 }); noise({ dur: 0.05, vol: 0.025, freq: 1800 }); },
+  broke(v, mult = 1) {
+    const f = (360 + v * 46) * (1 + (mult - 1) * 0.14);   // 连击越高，音越高
+    tone({ f, f2: 110, dur: 0.15, type: 'triangle', vol: 0.075 });
+    noise({ dur: 0.1, vol: 0.05, freq: 900 });
+  },
+  combo(m) { tone({ f: 600 + m * 150, f2: 900 + m * 150, dur: 0.07, type: 'sine', vol: 0.045 }); },
+  clink()  { tone({ f: 1500, f2: 950, dur: 0.06, vol: 0.03 }); },
+  laser()  { tone({ f: 1800, f2: 240, dur: 0.16, type: 'sawtooth', vol: 0.045 }); },
+  fireball() { tone({ f: 260, f2: 90, dur: 0.2, type: 'triangle', vol: 0.06 }); noise({ dur: 0.12, vol: 0.04, freq: 600 }); },
+  cannon() { tone({ f: 130, f2: 45, dur: 0.22, type: 'square', vol: 0.08 }); noise({ dur: 0.16, vol: 0.06, freq: 300 }); },
+  boom()   { tone({ f: 180, f2: 40, dur: 0.22, type: 'sawtooth', vol: 0.06 }); noise({ dur: 0.2, vol: 0.06, freq: 280 }); },
+  crisis() { [330, 260, 190].forEach((f, i) => tone({ f, f2: f * 0.6, dur: 0.2, type: 'sawtooth', vol: 0.07, delay: i * 0.14 })); },
+  heal()   { [660, 880, 1320].forEach((f, i) => tone({ f, dur: 0.14, type: 'sine', vol: 0.06, delay: i * 0.07 })); },
+  hurt()   { tone({ f: 210, f2: 55, dur: 0.42, type: 'sawtooth', vol: 0.11 }); noise({ dur: 0.28, vol: 0.09, freq: 400 }); },
+  over()   { [0, 0.15, 0.3].forEach((d, i) => tone({ f: [440, 330, 220][i], f2: [330, 220, 110][i], dur: 0.24, type: 'triangle', vol: 0.09, delay: d })); },
+  bonusIn(){ [660, 880, 1320].forEach((f, i) => tone({ f, dur: 0.12, type: 'sine', vol: 0.07, delay: i * 0.09 })); },
+  bonusGot(){ [660, 880, 1100, 1320].forEach((f, i) => tone({ f, dur: 0.14, type: 'triangle', vol: 0.08, delay: i * 0.06 })); },
+  levelUp(){ [523, 659, 784, 1046].forEach((f, i) => tone({ f, dur: 0.11, type: 'sine', vol: 0.06, delay: i * 0.06 })); },
+  upgrade(){ [784, 1175].forEach((f, i) => tone({ f, dur: 0.13, type: 'triangle', vol: 0.07, delay: i * 0.07 })); },
+};
+
+// ---------------- 7. 尺寸自适应 ----------------
+const TOP = 84;   // 玩家能到达的最高处（别钻到分数下面）
+
+function layout() {
+  const rect = canvas.getBoundingClientRect();
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  W = rect.width;
+  H = rect.height;
+
+  canvas.width = Math.round(W * dpr);
+  canvas.height = Math.round(H * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  player.x = clamp(player.x, 0, Math.max(0, W - player.w));
+  player.y = clamp(player.y, TOP, Math.max(TOP, H - player.h - 14));
+}
+
+// ---------------- 8. 流程控制 ----------------
+function start() {
+  phase = state.PLAYING;
+  blocks = [];
+  bullets = [];
+  beams = [];
+  particles = [];
+  popups = [];
+  bonusTarget = null;
+  banner = null;
+
+  score = 0;
+  comboHits = 0;
+  comboTimer = 0;
+  lives = CFG.lives;
+  elapsed = 0;
+  invuln = 0;
+  shake = 0;
+  flashRed = 0;
+  spawnTimer = 0.6;
+  fireTimer = 0;
+  nextBonusAt = CFG.bonusInterval;
+  bonusGap = CFG.bonusInterval;
+  crisis.active = false;
+  crisis.endAt = 0;
+  crisis.nextCheckAt = CFG.crisisFirstCheck;
+  crisis.chance = CFG.crisisChanceMin;
+
+  upgrades.rate = 1;
+  upgrades.shot = 1;
+  upgrades.move = 1;
+  upgrades.laser = 0;
+  upgrades.fireball = 0;
+  upgrades.cannon = 0;
+  upgrades.recovery = 0;
+  upgradeGap = CFG.upgradeFirst;
+  nextUpgradeAt = CFG.upgradeFirst;
+  upgradeOptions = [];
+  maxedNotified = false;
+
+  pointerX = null;
+  pointerY = null;
+  player.x = (W - player.w) / 2;
+  player.y = H - player.h - 28;
+  lastTs = 0;
+  ensureAudio();   // 趁用户这次点击/按键把音频解锁
+}
+
+function gameOver() {
+  phase = state.OVER;
+  burst(player.x + player.w / 2, player.y + player.h / 2, COLOR.player, 26);
+  SFX.over();
+  if (score > best) {
+    best = score;
+    saveBest(best);
+  }
+}
+
+function togglePause() {
+  if (phase === state.PLAYING) {
+    phase = state.PAUSED;
+  } else if (phase === state.PAUSED) {
+    phase = state.PLAYING;
+    lastTs = 0;
+  }
+}
+
+// 关闭升级界面（选完卡，或全满级提示后继续）
+function resumeAfterUpgrade() {
+  phase = state.PLAYING;
+  lastTs = 0;
+  pointerDown = false;
+  pointerX = null;
+  pointerY = null;
+  activePointerId = null;
+}
+
+// ---------------- 9. 输入 ----------------
+const keys = new Set();
+let pointerX = null;
+let pointerY = null;
+let pointerDown = false;
+let activePointerId = null;   // 正在控制角色的那根手指
+
+addEventListener('keydown', (e) => {
+  const watched = ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'KeyA', 'KeyD', 'KeyW', 'KeyS', 'Space', 'Escape', 'KeyM', 'Digit1', 'Digit2', 'Digit3'];
+  if (watched.includes(e.code)) e.preventDefault();
+
+  if (e.code === 'KeyM') {
+    muted = !muted;
+    saveMuted(muted);
+    if (!muted) SFX.hit();
+    return;
+  }
+
+  // 升级界面：1 / 2 / 3 对应本次给出的卡，其它键不响应
+  if (phase === state.UPGRADE) {
+    if (upgradeOptions.length === 0) {
+      if (e.code === 'Space' || e.code === 'Enter' || e.code === 'Escape') resumeAfterUpgrade();
+      return;
+    }
+    const idx = { Digit1: 0, Digit2: 1, Digit3: 2 }[e.code];
+    if (idx !== undefined && upgradeOptions[idx]) chooseUpgrade(upgradeOptions[idx]);
+    return;
+  }
+
+  if (e.code === 'Escape') {
+    togglePause();
+    return;
+  }
+
+  keys.add(e.code);
+
+  if ((phase === state.READY || phase === state.OVER) && (e.code === 'Space' || e.code === 'Enter')) {
+    start();
+  }
+});
+addEventListener('keyup', (e) => keys.delete(e.code));
+addEventListener('blur', () => {
+  keys.clear();
+  if (phase === state.PLAYING) togglePause();
+});
+
+function localPos(e) {
+  const r = canvas.getBoundingClientRect();
+  return { x: e.clientX - r.left, y: e.clientY - r.top };
+}
+
+canvas.addEventListener('pointerdown', (e) => {
+  try { canvas.setPointerCapture(e.pointerId); } catch { /* 忽略 */ }
+
+  // 升级界面：点哪张卡就选哪个（这里不限制手指，方便连点）
+  if (phase === state.UPGRADE) {
+    if (upgradeOptions.length === 0) {
+      resumeAfterUpgrade();
+      return;
+    }
+    const p = localPos(e);
+    const hit = cardRects().find((r) =>
+      p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h);
+    if (hit) chooseUpgrade(hit.key);
+    return;
+  }
+
+  if (phase === state.PAUSED) {
+    togglePause();
+    return;
+  }
+
+  // 多指触摸时只认第一根手指，第二根不会把角色拽走
+  if (activePointerId !== null) return;
+  activePointerId = e.pointerId;
+
+  if (phase !== state.PLAYING) start();
+
+  const p = localPos(e);
+  pointerDown = true;
+  pointerX = p.x;
+  pointerY = p.y;
+  ensureAudio();
+});
+canvas.addEventListener('pointermove', (e) => {
+  if (e.pointerId !== activePointerId) return;
+  if (!pointerDown || phase !== state.PLAYING) return;
+  const p = localPos(e);
+  pointerX = p.x;
+  pointerY = p.y;
+});
+function endPointer(e) {
+  if (e && activePointerId !== null && e.pointerId !== activePointerId) return;
+  activePointerId = null;
+  pointerDown = false;
+  pointerX = null;
+  pointerY = null;
+}
+canvas.addEventListener('pointerup', endPointer);
+canvas.addEventListener('pointercancel', endPointer);
+// 长按不要弹右键菜单（手机上是"保存图片"）
+canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+// 兜底：极老的微信内核（Chromium 55 以下）没有 PointerEvent，把触摸事件翻译成指针事件
+if (!window.PointerEvent) {
+  const fire = (type, t) => {
+    const ev = new Event(type, { bubbles: true });
+    ev.clientX = t.clientX;
+    ev.clientY = t.clientY;
+    ev.pointerId = t.identifier;
+    canvas.dispatchEvent(ev);
+  };
+  const wrapTouch = (type) => (e) => {
+    e.preventDefault();
+    for (let i = 0; i < e.changedTouches.length; i++) fire(type, e.changedTouches[i]);
+  };
+  canvas.addEventListener('touchstart', wrapTouch('pointerdown'), { passive: false });
+  canvas.addEventListener('touchmove', wrapTouch('pointermove'), { passive: false });
+  canvas.addEventListener('touchend', wrapTouch('pointerup'), { passive: false });
+  canvas.addEventListener('touchcancel', wrapTouch('pointercancel'), { passive: false });
+}
+
+addEventListener('resize', layout);
+addEventListener('orientationchange', () => setTimeout(layout, 120));
+
+// ---------------- 10. 生成物 ----------------
+// 分值越高 → 方块越大（更好打中）也越慢
+function blockColor(value) {
+  if (value >= 75) return '#c77dff';
+  if (value >= 50) return '#ff8c42';
+  if (value >= 25) return '#ffd166';
+  return '#5ad1ff';
+}
+
+// 分值上限：前期 30，之后逐步开放到 100
+function scoreValueMax() {
+  const t = Math.max(0, Math.min(1, (elapsed - CFG.scoreRampDelay) / CFG.scoreRamp));
+  return Math.round(CFG.scoreStartMax + (CFG.scoreMax - CFG.scoreStartMax) * t);
+}
+
+// 越活越快的下落速度倍率
+function speedMul() {
+  return 1 + Math.min(CFG.speedCap - 1, elapsed * 0.009);
+}
+
+function spawnHazard(base, mul) {
+  const size = Math.round(rand(40, 58));
+  blocks.push({
+    x: rand(0, Math.max(0, W - size)),
+    y: -size - rand(0, 30),
+    w: size,
+    h: size,
+    vy: base * mul * 0.95,
+    value: 0,
+    hp: 1,
+    flash: 0,
+    armor: 0,
+    guard: 0,
+    haz: true,
+  });
+}
+
+function spawnValueBlock(base, mul, armorChance) {
+  const maxValue = scoreValueMax();
+  const value = 1 + Math.floor(Math.random() * maxValue);        // 前期 1~30，后期最高 1~100
+  const big = value >= CFG.bigBlockMin;                          // 50 ~ 100 走大块规则
+  const size = Math.round(24 + Math.sqrt(value) * 5.2);          // 随分值增大
+  const w = size + Math.round(rand(-3, 7));
+  const armor = Math.random() < armorChance
+    ? rand(CFG.armorMin, CFG.armorMax)
+    : 0;
+  blocks.push({
+    x: rand(0, Math.max(0, W - w)),
+    y: -size - rand(0, 40),
+    w,
+    h: size,
+    vy: base * mul * (1.15 - Math.min(0.65, value * 0.0065)),
+    value,
+    hp: value,          // 基础耐久 = 分值 = 打掉得分
+    big,
+    flash: 0,
+    armor,
+    guard: 0,
+    haz: false,
+  });
+}
+
+// 炸弹：打爆后清除周围危险物，碰到玩家也会爆炸并扣命
+function spawnBomb(base, mul) {
+  const size = Math.round(rand(34, 42));
+  blocks.push({
+    x: rand(0, Math.max(0, W - size)),
+    y: -size - rand(0, 30),
+    w: size,
+    h: size,
+    vy: base * mul * 0.82,
+    value: 0,
+    hp: 3,
+    flash: 0,
+    armor: 0,
+    guard: 0,
+    bomb: true,
+    haz: false,
+  });
+}
+
+// 回血模块：打掉恢复 1 滴血
+function spawnHeal(base, mul) {
+  const size = 32;
+  blocks.push({
+    x: rand(0, Math.max(0, W - size)),
+    y: -size - rand(0, 30),
+    w: size,
+    h: size,
+    vy: base * mul * 0.78,
+    value: 0,
+    hp: 1,
+    flash: 0,
+    armor: 0,
+    guard: 0,
+    heal: 1,
+    haz: false,
+  });
+}
+
+function spawnCrisisWave(base, mul, armorChance) {
+  // 分值方块一定跟着出现，保证危机里仍有分可拿
+  spawnValueBlock(base, mul, armorChance);
+
+  // 危险物数量和出现频率都提高：每波至少 1 个，概率再加 1 个
+  spawnHazard(base, mul);
+  if (Math.random() < 0.65) spawnHazard(base, mul);
+
+  // 危机专属炸弹
+  if (Math.random() < CFG.crisisBombChance) spawnBomb(base, mul);
+
+  // 危机里也可能掉回血模块
+  if (lives < CFG.lives && Math.random() < CFG.crisisHealChance) spawnHeal(base, mul);
+}
+
+function spawnBlock() {
+  const base = 150 + 30 * Math.min(1, elapsed / 60);     // 150 → 180
+  const mul = speedMul();
+  const hazardChance = Math.min(CFG.hazardChance, elapsed / 40 * 0.08);
+  const armorChance = Math.min(
+    CFG.armorMaxChance,
+    CFG.armorStartChance +
+      (CFG.armorMaxChance - CFG.armorStartChance) * Math.min(1, elapsed / CFG.armorRamp)
+  );
+
+  if (crisis.active) {
+    spawnCrisisWave(base, mul, armorChance);
+    spawnTimer = Math.max(0.36, 0.72 - elapsed * 0.002);  // 危机波次更密
+    return;
+  }
+
+  // 普通模式：概率掉回血模块，否则随机掉分值方块或危险物
+  if (lives < CFG.lives && Math.random() < CFG.healModuleChance) {
+    spawnHeal(base, mul);
+  } else if (Math.random() < hazardChance) {
+    spawnHazard(base, mul);
+  } else {
+    spawnValueBlock(base, mul, armorChance);
+  }
+
+  spawnTimer = Math.max(CFG.spawnMin, CFG.spawnStart - elapsed * CFG.spawnDecay);
+}
+
+function spawnBonus() {
+  const size = 56;
+  bonusTarget = {
+    x: rand(16, Math.max(16, W - size - 16)),
+    y: -size,
+    w: size,
+    h: size,
+    vy: 105,
+    hp: CFG.bonusHp,
+    flash: 0,
+  };
+  banner = { text: '奖励目标出现！打掉 +20', color: COLOR.gold, t: 0, life: 2.6 };
+  SFX.bonusIn();
+}
+
+function shoot() {
+  const n = bulletCount();
+  const cx = player.x + player.w / 2;
+  const gap = 10;
+  // 多弹道：以炮口为中心左右散开
+  for (let i = 0; i < n; i++) {
+    const off = (i - (n - 1) / 2) * gap;
+    bullets.push({
+      x: cx + off - 3,
+      y: player.y - 16,
+      w: 6,
+      h: 18,
+      vy: -CFG.bulletSpeed,
+    });
+  }
+  SFX.shoot();
+}
+
+// 特殊攻击：激光瞬发穿透，火球/炮弹发射爆炸弹，恢复光束回血
+function fireSpecial(key) {
+  const s = SPECIALS[key];
+  const cx = player.x + player.w / 2;
+
+  if (key === 'laser') {
+    beams.push({ x: cx, y: player.y - 6, t: 0, life: 0.16, color: '#e0fbff', glow: 'rgba(102, 224, 255, 0.9)' });
+
+    // 激光是一条竖线，能同时打穿路径上的所有目标
+    for (let i = blocks.length - 1; i >= 0; i--) {
+      const b = blocks[i];
+      if (b.y < player.y && b.y + b.h > 0 &&
+          b.x < cx + 6 && b.x + b.w > cx - 6) {
+        damageBlockAt(i, s.damage, cx, Math.max(b.y, 0));
+      }
+    }
+    if (bonusTarget &&
+        bonusTarget.y < player.y && bonusTarget.y + bonusTarget.h > 0 &&
+        bonusTarget.x < cx + 6 && bonusTarget.x + bonusTarget.w > cx - 6) {
+      damageBonus(s.damage, cx, bonusTarget.y + bonusTarget.h / 2);
+    }
+    shake = Math.max(shake, 0.18);
+    SFX.laser();
+    return;
+  }
+
+  if (key === 'recovery') {
+    if (healPlayer(1)) {
+      beams.push({
+        x: cx,
+        y: player.y - 6,
+        t: 0,
+        life: 0.32,
+        color: '#7dffb2',
+        glow: 'rgba(125, 255, 178, 0.9)',
+      });
+    }
+    return;
+  }
+
+  const isFireball = key === 'fireball';
+  bullets.push({
+    kind: key,
+    x: cx - (isFireball ? 9 : 7),
+    y: player.y - 20,
+    w: isFireball ? 18 : 14,
+    h: isFireball ? 18 : 26,
+    vy: isFireball ? -560 : -820,
+    dmg: s.damage,
+    radius: isFireball ? 76 : 48,
+    color: s.color,
+  });
+  SFX[key]();
+}
+
+// 每次普通开火时分别判定特殊攻击 / 恢复光束是否触发
+function rollSpecials() {
+  for (const k of SPECIAL_ORDER) {
+    const lv = upgrades[k];
+    if (!lv) continue;
+    if (SPECIALS[k].heal && lives >= CFG.lives) continue;  // 满血时不浪费回血
+    const chance = SPECIALS[k].chance[lv - 1] || 0;
+    if (Math.random() < chance) fireSpecial(k);
+  }
+}
+
+// 护甲：每 1 点伤害有 armor 概率被免疫，等效于 10%~30% 免伤
+function applyArmor(b, dmg) {
+  if (!b.armor) return dmg;
+  let dealt = 0;
+  for (let i = 0; i < dmg; i++) {
+    if (Math.random() >= b.armor) dealt += 1;
+  }
+  return dealt;
+}
+
+// 对指定方块造成伤害；击杀时结算分数和连击
+function damageBlockAt(i, dmg, hx, hy) {
+  const b = blocks[i];
+
+  if (b.heal) {
+    blocks.splice(i, 1);
+    burst(hx, hy, '#7dffb2', 8);
+    if (!healPlayer(1)) popup(hx, hy, '血量已满', COLOR.dim);
+    return;
+  }
+
+  if (b.bomb) {
+    b.flash = 0.1;
+    b.hp -= dmg;
+    if (b.hp <= 0) {
+      blocks.splice(i, 1);
+      explodeBomb(b);
+    } else {
+      burst(hx, hy, '#ff8c42', 4);
+      SFX.hit();
+    }
+    return;
+  }
+
+  if (b.haz) {
+    b.flash = 0.1;
+    burst(hx, hy, '#ffd93d', 4);
+    SFX.clink();
+    return;
+  }
+
+  // 50~100 的大块：普通攻击每次至少扣 10，打到 0 才消失得分
+  const incoming = b.big ? Math.max(CFG.bigBlockStep, dmg) : dmg;
+  let dealt = applyArmor(b, incoming);
+  if (b.big) dealt = Math.max(CFG.bigBlockStep, dealt);
+  if (dealt <= 0) {
+    b.guard = 0.18;
+    burst(hx, hy, '#b9f6ff', 4);
+    SFX.clink();
+    return;
+  }
+
+  b.flash = 0.1;
+  b.hp -= dealt;
+  if (b.hp <= 0) {
+    const mult = registerKill();
+    score += b.value * mult;
+    burst(b.x + b.w / 2, b.y + b.h / 2, blockColor(b.value), 12 + mult * 3);
+    popup(b.x + b.w / 2, b.y, '+' + (b.value * mult), mult >= 2 ? COLOR.gold : blockColor(b.value));
+    blocks.splice(i, 1);
+    SFX.broke(b.value, mult);
+  } else {
+    burst(hx, hy, blockColor(b.value), 3);
+    SFX.hit();
+  }
+}
+
+// 金色奖励目标受击
+function damageBonus(dmg, hx, hy) {
+  if (!bonusTarget) return;
+  const target = bonusTarget;
+  target.hp -= dmg;
+  target.flash = 0.1;
+  burst(hx, hy, COLOR.gold, 6);
+  SFX.hit();
+
+  if (target.hp <= 0) {
+    score += CFG.bonusScore;
+    burst(target.x + target.w / 2, target.y + target.h / 2, COLOR.gold, 30);
+    popup(target.x + target.w / 2, target.y, '+' + CFG.bonusScore, COLOR.gold);
+    banner = { text: '奖励到手！+' + CFG.bonusScore, color: COLOR.gold, t: 0, life: 2 };
+    bonusTarget = null;
+    SFX.bonusGot();
+  }
+}
+
+// 范围爆炸：火球和炮弹共用
+function explode(x, y, dmg, radius, color) {
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    const b = blocks[i];
+    const px = clamp(x, b.x, b.x + b.w);
+    const py = clamp(y, b.y, b.y + b.h);
+    const dx = x - px;
+    const dy = y - py;
+    if (dx * dx + dy * dy <= radius * radius) {
+      damageBlockAt(i, dmg, x, y);
+    }
+  }
+
+  if (bonusTarget) {
+    const b = bonusTarget;
+    const px = clamp(x, b.x, b.x + b.w);
+    const py = clamp(y, b.y, b.y + b.h);
+    const dx = x - px;
+    const dy = y - py;
+    if (dx * dx + dy * dy <= radius * radius) {
+      damageBonus(dmg, x, y);
+    }
+  }
+
+  burst(x, y, color, 24);
+  shake = Math.max(shake, 0.25);
+  SFX.boom();
+}
+
+// 炸弹爆炸：清除周围危险物，给玩家一点反制手段
+function explodeBomb(b) {
+  const x = b.x + b.w / 2;
+  const y = b.y + b.h / 2;
+  const radius = 132;
+
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    const o = blocks[i];
+    if (!o.haz) continue;
+    const px = clamp(x, o.x, o.x + o.w);
+    const py = clamp(y, o.y, o.y + o.h);
+    const dx = x - px;
+    const dy = y - py;
+    if (dx * dx + dy * dy <= radius * radius) {
+      blocks.splice(i, 1);
+      burst(o.x + o.w / 2, o.y + o.h / 2, COLOR.hazard, 16);
+    }
+  }
+
+  burst(x, y, '#ff8c42', 30);
+  shake = Math.max(shake, 0.55);
+  flashRed = Math.max(flashRed, 0.12);
+  SFX.boom();
+}
+
+function burst(x, y, color, n) {
+  for (let i = 0; i < n; i++) {
+    if (particles.length > 280) break;
+    const a = rand(0, Math.PI * 2);
+    const sp = rand(60, 340);
+    particles.push({
+      x, y,
+      vx: Math.cos(a) * sp,
+      vy: Math.sin(a) * sp,
+      t: 0,
+      life: rand(0.3, 0.7),
+      size: rand(2, 5),
+      color,
+    });
+  }
+}
+
+function popup(x, y, text, color) {
+  popups.push({ x, y, text, color, t: 0, life: 0.9 });
+}
+
+// ---------------- 11. 每帧更新 ----------------
+function update(dt) {
+  if (phase !== state.PLAYING) return;
+
+  elapsed += dt;
+  if (invuln > 0) invuln -= dt;
+  if (shake > 0) shake = Math.max(0, shake - dt * 1.6);
+  if (flashRed > 0) flashRed = Math.max(0, flashRed - dt * 2);
+
+  // --- 连击倒计时：2 秒内没有新击杀就断 ---
+  if (comboTimer > 0) {
+    comboTimer -= dt;
+    if (comboTimer <= 0) {
+      comboTimer = 0;
+      comboHits = 0;
+    }
+  }
+
+  // --- 危机模式：检查触发 / 结束 ---
+  if (crisis.active) {
+    if (elapsed >= crisis.endAt) {
+      crisis.active = false;
+      crisis.nextCheckAt = elapsed + CFG.crisisCheckGap;
+      banner = { text: '危机解除', color: COLOR.player, t: 0, life: 2 };
+      SFX.levelUp();
+    }
+  } else if (elapsed >= crisis.nextCheckAt) {
+    crisis.chance = Math.min(
+      CFG.crisisChanceMax,
+      CFG.crisisChanceMin +
+        (CFG.crisisChanceMax - CFG.crisisChanceMin) * Math.min(1, elapsed / CFG.crisisChanceRamp)
+    );
+    if (Math.random() < crisis.chance) {
+      crisis.active = true;
+      crisis.endAt = elapsed + CFG.crisisDuration;
+      spawnTimer = 0.12;
+      flashRed = Math.max(flashRed, 0.18);
+      shake = Math.max(shake, 0.25);
+      banner = { text: '危机模式！炸弹与危险物增多', color: COLOR.hazard, t: 0, life: 2.5 };
+      SFX.crisis();
+    }
+    crisis.nextCheckAt = elapsed + CFG.crisisCheckGap;
+  }
+
+  // --- 自由移动：键盘优先，否则跟随指针 ---
+  let dx = 0, dy = 0;
+  if (keys.has('ArrowLeft') || keys.has('KeyA')) dx -= 1;
+  if (keys.has('ArrowRight') || keys.has('KeyD')) dx += 1;
+  if (keys.has('ArrowUp') || keys.has('KeyW')) dy -= 1;
+  if (keys.has('ArrowDown') || keys.has('KeyS')) dy += 1;
+
+  if (dx || dy) {
+    const len = Math.hypot(dx, dy);          // 斜着走不能更快
+    const sp = moveSpeed();
+    player.x += (dx / len) * sp * dt;
+    player.y += (dy / len) * sp * dt;
+    pointerX = null;
+    pointerY = null;
+  } else if (pointerX !== null) {
+    // 手指/鼠标上方留一点偏移，避免被手指挡住
+    const tx = pointerX - player.w / 2;
+    const ty = pointerY - player.h / 2 - 34;
+    const k = Math.min(1, dt * 16);
+    player.x += (tx - player.x) * k;
+    player.y += (ty - player.y) * k;
+  }
+  player.x = clamp(player.x, 0, W - player.w);
+  player.y = clamp(player.y, TOP, H - player.h - 14);
+
+  // --- 射击 ---
+  const firing = keys.has('Space') || pointerDown;
+  if (firing) {
+    fireTimer -= dt;
+    let guard = 0;
+    while (fireTimer <= 0 && guard++ < 6) {
+      shoot();
+      rollSpecials();          // 每次开火按特殊武器等级判定触发
+      fireTimer += fireRate();
+    }
+  } else {
+    fireTimer = 0;
+  }
+
+  // --- 生成 ---
+  spawnTimer -= dt;
+  if (spawnTimer <= 0) spawnBlock();
+
+  // --- 奖励目标：第一次 30 秒，之后每次再多等 10 秒 ---
+  if (elapsed >= nextBonusAt) {
+    bonusGap += CFG.bonusStep;
+    nextBonusAt = elapsed + bonusGap;
+    if (!bonusTarget) spawnBonus();
+  }
+  if (bonusTarget) {
+    bonusTarget.y += bonusTarget.vy * dt;
+    if (bonusTarget.flash > 0) bonusTarget.flash -= dt;
+    if (bonusTarget.y > H + 80) {
+      bonusTarget = null;
+      banner = { text: '奖励目标溜走了…', color: COLOR.dim, t: 0, life: 2 };
+    }
+  }
+
+  // --- 下落 + 回收 ---
+  for (const b of blocks) {
+    b.y += b.vy * dt;
+    if (b.flash > 0) b.flash -= dt;
+    if (b.guard > 0) b.guard -= dt;
+  }
+  blocks = blocks.filter((b) => b.y < H + 80);
+
+  for (const bul of bullets) bul.y += bul.vy * dt;
+  bullets = bullets.filter((bul) => bul.y + bul.h > -10);
+
+  for (const beam of beams) beam.t += dt;
+  beams = beams.filter((beam) => beam.t < beam.life);
+
+  // --- 子弹命中 ---
+  for (let i = bullets.length - 1; i >= 0; i--) {
+    const bul = bullets[i];
+    let consumed = false;
+
+    // 火球 / 炮弹：命中后范围爆炸
+    if (bul.kind === 'fireball' || bul.kind === 'cannon') {
+      const bx = bul.x + bul.w / 2;
+      const by = bul.y + bul.h / 2;
+
+      if (bonusTarget && overlaps(bul, bonusTarget)) {
+        explode(bx, by, bul.dmg, bul.radius, bul.color);
+        consumed = true;
+      } else {
+        for (let j = blocks.length - 1; j >= 0; j--) {
+          if (!overlaps(bul, blocks[j])) continue;
+          explode(bx, by, bul.dmg, bul.radius, bul.color);
+          consumed = true;
+          break;
+        }
+      }
+
+      if (consumed) bullets.splice(i, 1);
+      continue;
+    }
+
+    if (bonusTarget && overlaps(bul, bonusTarget)) {
+      damageBonus(1, bul.x + bul.w / 2, bul.y);
+      consumed = true;
+    } else {
+      for (let j = blocks.length - 1; j >= 0; j--) {
+        if (!overlaps(bul, blocks[j])) continue;
+        consumed = true;
+        damageBlockAt(j, 1, bul.x + bul.w / 2, bul.y);
+        break;
+      }
+    }
+
+    if (consumed) bullets.splice(i, 1);
+  }
+
+  // --- 撞到东西：扣一条命 ---
+  if (invuln <= 0) {
+    const hb = { x: player.x + 12, y: player.y + 12, w: player.w - 24, h: player.h - 24 };
+    for (let i = 0; i < blocks.length; i++) {
+      if (!overlaps(hb, blocks[i])) continue;
+      if (blocks[i].heal) continue;         // 回血模块不会伤害玩家
+
+      const b = blocks.splice(i, 1)[0];
+      if (b.bomb) {
+        explodeBomb(b);
+      } else {
+        burst(b.x + b.w / 2, b.y + b.h / 2, b.haz ? COLOR.hazard : blockColor(b.value), 18);
+      }
+      hurt();
+      break;
+    }
+  }
+
+  // --- 粒子 / 飘字 / 横幅 ---
+  for (const p of particles) {
+    p.t += dt;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.vy += 900 * dt;
+  }
+  particles = particles.filter((p) => p.t < p.life);
+
+  for (const t of popups) {
+    t.t += dt;
+    t.y -= 60 * dt;
+  }
+  popups = popups.filter((t) => t.t < t.life);
+
+  if (banner) {
+    banner.t += dt;
+    if (banner.t >= banner.life) banner = null;
+  }
+
+  // --- 到点就弹升级（放在最后，避免刚死就弹） ---
+  if (phase === state.PLAYING && elapsed >= nextUpgradeAt) openUpgrade();
+}
+
+// 打碎一个方块时调用：接上连击、返回本次应该乘的倍率
+function registerKill() {
+  comboHits = comboTimer > 0 ? comboHits + 1 : 1;
+  comboTimer = COMBO_WINDOW;
+  const mult = Math.min(COMBO_MAX, comboHits);
+  if (mult >= 2) SFX.combo(mult);   // 只有从 ×2 起才响，避免太吵
+  return mult;
+}
+
+function hurt() {
+  lives -= 1;
+  invuln = CFG.invulnTime;
+  shake = 0.5;
+  flashRed = 0.42;
+  comboHits = 0;        // 挨打就断连击
+  comboTimer = 0;
+  SFX.hurt();
+  if (lives <= 0) gameOver();
+}
+
+// 回血：每次恢复 1 滴，不能超过上限
+function healPlayer(n) {
+  if (lives >= CFG.lives) return false;
+  lives = Math.min(CFG.lives, lives + n);
+  burst(player.x + player.w / 2, player.y + player.h / 2, '#7dffb2', 18);
+  popup(player.x + player.w / 2, player.y - 6, '+' + n + ' 血', '#7dffb2');
+  SFX.heal();
+  return true;
+}
+
+// ---------------- 12. 每帧绘制 ----------------
+function roundRect(x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+const FONT = 'ui-sans-serif, system-ui, "Microsoft YaHei", sans-serif';
+
+function draw() {
+  ctx.fillStyle = COLOR.bg;
+  ctx.fillRect(0, 0, W, H);
+
+  // 网格
+  const g = 40;
+  ctx.strokeStyle = COLOR.grid;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let x = g; x < W; x += g) { ctx.moveTo(x + 0.5, 0); ctx.lineTo(x + 0.5, H); }
+  for (let y = g; y < H; y += g) { ctx.moveTo(0, y + 0.5); ctx.lineTo(W, y + 0.5); }
+  ctx.stroke();
+
+  // 危机模式：淡红底色 + 红色边框
+  if (crisis.active) {
+    const a = 0.035 + Math.abs(Math.sin(elapsed * 4)) * 0.025;
+    ctx.fillStyle = `rgba(255, 60, 70, ${a})`;
+    ctx.fillRect(0, 0, W, H);
+    ctx.strokeStyle = 'rgba(255, 77, 94, 0.55)';
+    ctx.lineWidth = 3;
+    ctx.strokeRect(2, 2, W - 4, H - 4);
+  }
+
+  // 世界层（受伤时整体抖一下）
+  ctx.save();
+  if (shake > 0.01) {
+    ctx.translate(rand(-1, 1) * 11 * shake, rand(-1, 1) * 11 * shake);
+  }
+  if (bonusTarget) drawBonus(bonusTarget);
+  drawBlocks();
+  drawBeams();
+  drawBullets();
+  drawPlayer();
+  drawParticles();
+  drawPopups();
+  ctx.restore();
+
+  // 受伤红屏
+  if (flashRed > 0) {
+    ctx.fillStyle = `rgba(255, 60, 70, ${flashRed * 0.45})`;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  drawHearts();
+  drawHud();
+
+  if (phase === state.READY) {
+    overlay('危险方块', [
+      'WASD / 方向键 全屏移动，也可以直接拖动',
+      '按住空格 / 鼠标 向上射击',
+      '数字 = 基础耐久 = 打掉得分（前期 1~30，后期最高 100）',
+      '50+ 大块：每次至少扣 10，打到 0 才得分',
+      '绿色 + 模块打掉回 1 血；恢复光束最高 Lv3',
+      '部分方块带护甲：10% ~ 30% 免伤，存活越久越常见',
+      '红色危险物打不掉，碰到掉一条命（共 3 条）',
+      '普通武器 Lv10；特殊攻击 Lv5；恢复光束 Lv3',
+      '2 秒内连续击杀 → 分数 ×2 / ×3 / ×4，挨打就断',
+      '活得越久越危险；危机模式会召来炸弹和更多危险物',
+    ], '按空格 / 点击开始　·　M 静音');
+  } else if (phase === state.UPGRADE) {
+    drawUpgrade();
+  } else if (phase === state.OVER) {
+    overlay('游戏结束', [`本局得分 ${score}`, `最佳 ${best}`], '按空格 / 点击再来一局');
+  } else if (phase === state.PAUSED) {
+    overlay('暂停', ['按 Esc 或点击画面继续'], '');
+  }
+
+  if (banner) drawBanner(banner);
+}
+
+function drawBlocks() {
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+
+  for (const b of blocks) {
+    if (b.heal) {
+      const cx = b.x + b.w / 2;
+      const cy = b.y + b.h / 2;
+      const r = b.w / 2;
+      ctx.save();
+      ctx.shadowColor = 'rgba(125, 255, 178, 0.8)';
+      ctx.shadowBlur = 18;
+      ctx.fillStyle = '#0d2a1f';
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = '#7dffb2';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.fillStyle = '#7dffb2';
+      ctx.font = `700 ${Math.round(b.w * 0.62)}px ${FONT}`;
+      ctx.fillText('+', cx, cy + 1);
+      ctx.restore();
+      continue;
+    }
+
+    if (b.bomb) {
+      const cx = b.x + b.w / 2;
+      const cy = b.y + b.h / 2;
+      const r = b.w / 2;
+
+      ctx.save();
+      ctx.shadowColor = 'rgba(255, 140, 66, 0.75)';
+      ctx.shadowBlur = 18;
+      ctx.fillStyle = '#171b22';
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = '#ff8c42';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      if (b.flash > 0) {
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.55)';
+        ctx.beginPath();
+        ctx.arc(cx, cy, r - 1, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // 引线 + 火花
+      ctx.strokeStyle = '#8b98a9';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(cx + r * 0.35, cy - r * 0.75);
+      ctx.quadraticCurveTo(cx + r * 0.95, cy - r * 1.05, cx + r * 0.65, cy - r * 1.3);
+      ctx.stroke();
+      ctx.fillStyle = '#ffd166';
+      ctx.beginPath();
+      ctx.arc(cx + r * 0.65, cy - r * 1.3, 3, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.fillStyle = b.flash > 0 ? '#ffffff' : '#ff8c42';
+      ctx.font = `700 ${Math.round(b.w * 0.5)}px ${FONT}`;
+      ctx.fillText('!', cx, cy + 1);
+
+      // 剩余耐久小点
+      for (let i = 0; i < 3; i++) {
+        ctx.fillStyle = i < b.hp ? '#ff8c42' : 'rgba(255, 255, 255, 0.18)';
+        ctx.beginPath();
+        ctx.arc(cx - 8 + i * 8, cy + r - 4, 1.7, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.restore();
+      continue;
+    }
+
+    if (b.haz) {
+      // 危险物：红色描边 + 斜纹 + 叉，一眼看出「不能打」
+      ctx.save();
+      ctx.shadowColor = 'rgba(255, 77, 94, 0.55)';
+      ctx.shadowBlur = 16;
+      ctx.fillStyle = '#2b1720';
+      roundRect(b.x, b.y, b.w, b.h, 10);
+      ctx.fill();
+      ctx.restore();
+
+      ctx.save();
+      roundRect(b.x, b.y, b.w, b.h, 10);
+      ctx.clip();
+      ctx.strokeStyle = 'rgba(255, 77, 94, 0.35)';
+      ctx.lineWidth = 5;
+      ctx.beginPath();
+      for (let i = -b.h; i < b.w + b.h; i += 14) {
+        ctx.moveTo(b.x + i, b.y + b.h);
+        ctx.lineTo(b.x + i + b.h, b.y);
+      }
+      ctx.stroke();
+      ctx.restore();
+
+      ctx.strokeStyle = COLOR.hazard;
+      ctx.lineWidth = 2;
+      roundRect(b.x + 1, b.y + 1, b.w - 2, b.h - 2, 9);
+      ctx.stroke();
+
+      ctx.font = `700 ${Math.round(b.w * 0.42)}px ${FONT}`;
+      ctx.fillStyle = b.flash > 0 ? '#ffffff' : COLOR.hazard;
+      ctx.fillText('✕', b.x + b.w / 2, b.y + b.h / 2 + 1);
+      continue;
+    }
+
+    ctx.save();
+    ctx.shadowColor = 'rgba(0, 0, 0, 0.45)';
+    ctx.shadowBlur = 12;
+    ctx.fillStyle = blockColor(b.value);
+    roundRect(b.x, b.y, b.w, b.h, 9);
+    ctx.fill();
+    ctx.restore();
+
+    if (b.flash > 0) {
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.75)';
+      roundRect(b.x, b.y, b.w, b.h, 9);
+      ctx.fill();
+    }
+
+    // 50~100 的大块：内圈标记，表示要连续打到 0
+    if (b.big) {
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.22)';
+      ctx.lineWidth = 2;
+      roundRect(b.x + 4, b.y + 4, b.w - 8, b.h - 8, 7);
+      ctx.stroke();
+    }
+
+    // 护甲标记：右上角显示免伤百分比
+    if (b.armor > 0) {
+      const ax = b.x + b.w - 10;
+      const ay = b.y + 10;
+      ctx.fillStyle = 'rgba(10, 14, 20, 0.62)';
+      ctx.beginPath();
+      ctx.arc(ax, ay, 9, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(185, 246, 255, 0.9)';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      ctx.fillStyle = '#b9f6ff';
+      ctx.font = `700 9px ${FONT}`;
+      ctx.fillText(Math.round(b.armor * 100) + '%', ax, ay + 0.5);
+    }
+
+    // 这次伤害被完全挡住时闪一下护盾
+    if (b.guard > 0) {
+      ctx.strokeStyle = 'rgba(185, 246, 255, 0.95)';
+      ctx.lineWidth = 2;
+      roundRect(b.x - 2, b.y - 2, b.w + 4, b.h + 4, 11);
+      ctx.stroke();
+    }
+
+    const label = String(b.hp);
+    const factor = label.length >= 3 ? 0.33 : (label.length === 2 ? 0.4 : 0.46);
+    const size = Math.max(10, Math.round(Math.min(b.w, b.h) * factor));
+    ctx.font = `700 ${size}px ${FONT}`;
+    ctx.fillStyle = 'rgba(10, 14, 20, 0.82)';
+    // 显示剩余耐久，归零即碎
+    ctx.fillText(label, b.x + b.w / 2, b.y + b.h / 2 + 1);
+  }
+}
+
+function drawBonus(b) {
+  const cx = b.x + b.w / 2;
+  const cy = b.y + b.h / 2;
+  const pulse = 1 + Math.sin(elapsed * 6) * 0.07;
+
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.scale(pulse, pulse);
+  ctx.rotate(Math.PI / 4);
+  ctx.shadowColor = 'rgba(255, 217, 61, 0.75)';
+  ctx.shadowBlur = 28;
+  ctx.fillStyle = b.flash > 0 ? '#ffffff' : COLOR.gold;
+  const s = b.w * 0.72;
+  roundRect(-s / 2, -s / 2, s, s, 8);
+  ctx.fill();
+  ctx.restore();
+
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = `700 20px ${FONT}`;
+  ctx.fillStyle = '#3a2b00';
+  ctx.fillText(String(CFG.bonusScore), cx, cy + 1);
+
+  for (let i = 0; i < b.hp; i++) {
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.9)';
+    ctx.beginPath();
+    ctx.arc(cx - (b.hp - 1) * 6 + i * 12, b.y + b.h + 10, 2.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+function drawBeams() {
+  for (const beam of beams) {
+    const a = Math.max(0, 1 - beam.t / beam.life);
+    if (a <= 0) continue;
+
+    ctx.save();
+    ctx.globalAlpha = a;
+    ctx.strokeStyle = beam.color || '#e0fbff';
+    ctx.shadowColor = beam.glow || 'rgba(102, 224, 255, 0.9)';
+    ctx.shadowBlur = 20;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(beam.x, beam.y);
+    ctx.lineTo(beam.x, 0);
+    ctx.stroke();
+
+    ctx.globalAlpha = a * 0.35;
+    ctx.lineWidth = 12;
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+function drawBullets() {
+  for (const b of bullets) {
+    if (b.kind === 'fireball') {
+      ctx.save();
+      ctx.shadowColor = 'rgba(255, 140, 66, 0.9)';
+      ctx.shadowBlur = 18;
+      ctx.fillStyle = '#ffb347';
+      ctx.beginPath();
+      ctx.arc(b.x + b.w / 2, b.y + b.h / 2, b.w / 2, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+      continue;
+    }
+
+    if (b.kind === 'cannon') {
+      ctx.save();
+      ctx.shadowColor = 'rgba(255, 217, 61, 0.7)';
+      ctx.shadowBlur = 14;
+      ctx.fillStyle = '#ffd166';
+      roundRect(b.x, b.y, b.w, b.h, 5);
+      ctx.fill();
+      ctx.strokeStyle = '#ff8c42';
+      ctx.lineWidth = 2;
+      roundRect(b.x + 2, b.y + 2, b.w - 4, b.h - 4, 4);
+      ctx.stroke();
+      ctx.restore();
+      continue;
+    }
+
+    ctx.save();
+    ctx.shadowColor = COLOR.bulletGlow;
+    ctx.shadowBlur = 12;
+    ctx.fillStyle = COLOR.bullet;
+    roundRect(b.x, b.y, b.w, b.h, 3);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+function drawPlayer() {
+  // 无敌期间闪烁
+  const blink = invuln > 0 && Math.floor(elapsed * 12) % 2 === 0;
+  ctx.save();
+  ctx.globalAlpha = blink ? 0.35 : 1;
+  ctx.shadowColor = COLOR.playerGlow;
+  ctx.shadowBlur = 18;
+  ctx.fillStyle = COLOR.player;
+  roundRect(player.x, player.y, player.w, player.h, 12);
+  ctx.fill();
+  ctx.restore();
+
+  ctx.globalAlpha = blink ? 0.35 : 1;
+  ctx.fillStyle = COLOR.player;
+  roundRect(player.x + player.w / 2 - 4, player.y - 8, 8, 10, 3);
+  ctx.fill();
+  ctx.globalAlpha = 1;
+}
+
+function drawParticles() {
+  for (const p of particles) {
+    ctx.globalAlpha = 1 - p.t / p.life;
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x, p.y, p.size, p.size);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawPopups() {
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = `700 18px ${FONT}`;
+  for (const t of popups) {
+    ctx.globalAlpha = 1 - t.t / t.life;
+    ctx.fillStyle = t.color;
+    ctx.fillText(t.text, t.x, t.y);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawHearts() {
+  const gap = 26;
+  const cx = W / 2 - ((CFG.lives - 1) * gap) / 2;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = '20px ui-sans-serif, system-ui, "Segoe UI Symbol", sans-serif';
+  for (let i = 0; i < CFG.lives; i++) {
+    ctx.fillStyle = i < lives ? '#ff5a6e' : 'rgba(255, 255, 255, 0.16)';
+    ctx.fillText('♥', cx + i * gap, 30);
+  }
+}
+
+function fmtTime(sec) {
+  const s = Math.max(0, Math.ceil(sec));
+  return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+}
+
+function drawHud() {
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+
+  // 危机模式倒计时
+  if (crisis.active) {
+    const remain = Math.max(0, Math.ceil(crisis.endAt - elapsed));
+    ctx.save();
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = Math.floor(elapsed * 6) % 2 ? '#ff4d5e' : '#ffd166';
+    ctx.font = `700 12px ${FONT}`;
+    ctx.fillText('危机模式 ' + remain + 's', W / 2, 55);
+    ctx.restore();
+  }
+
+  ctx.fillStyle = COLOR.dim;
+  ctx.font = `600 13px ${FONT}`;
+  ctx.fillText('分数', 20, 14);
+
+  ctx.fillStyle = COLOR.text;
+  ctx.font = `700 38px ${FONT}`;
+  ctx.fillText(String(score), 20, 30);
+
+  ctx.fillStyle = COLOR.dim;
+  ctx.font = `600 13px ${FONT}`;
+  ctx.fillText('存活 ' + elapsed.toFixed(1) + 's', 20, 76);
+
+  ctx.textAlign = 'left';
+  ctx.fillStyle = 'rgba(55, 224, 194, 0.75)';
+  ctx.font = `600 11px ${FONT}`;
+  ctx.fillText(`射速${upgrades.rate} · 弹道${upgrades.shot} · 移速${upgrades.move}`, 20, H - 46);
+
+  // 已解锁的特殊武器
+  const unlocked = SPECIAL_ORDER.filter((k) => upgrades[k] > 0);
+  if (unlocked.length) {
+    let sx = 20;
+    ctx.font = `600 11px ${FONT}`;
+    for (const k of unlocked) {
+      ctx.fillStyle = SPECIALS[k].color;
+      ctx.fillText('● ' + (SPECIALS[k].short || SPECIALS[k].name) + ' Lv' + upgrades[k], sx, H - 30);
+      sx += 60;
+    }
+  }
+
+  ctx.textAlign = 'right';
+  ctx.fillStyle = COLOR.dim;
+  ctx.font = `600 13px ${FONT}`;
+  ctx.fillText('最佳 ' + best, W - 20, 14);
+
+  if (bonusTarget) {
+    ctx.fillStyle = COLOR.gold;
+    ctx.fillText('奖励目标出现中', W - 20, 36);
+  } else {
+    ctx.fillStyle = 'rgba(255, 217, 61, 0.75)';
+    ctx.fillText('奖励 ' + fmtTime(nextBonusAt - elapsed) + ' 后', W - 20, 36);
+  }
+
+  ctx.fillStyle = 'rgba(255, 140, 66, 0.9)';
+  ctx.fillText('速度 ×' + speedMul().toFixed(2), W - 20, 58);
+
+  ctx.fillStyle = 'rgba(55, 224, 194, 0.8)';
+  ctx.fillText(allMaxed() ? '武器已满级' : '升级 ' + fmtTime(nextUpgradeAt - elapsed) + ' 后', W - 20, 80);
+
+  // --- 连击倍率（右上角，×2 起才显示） ---
+  if (comboHits >= 2) {
+    const mult = Math.min(COMBO_MAX, comboHits);
+    const low = comboTimer < 0.6;   // 快断了就闪
+    ctx.save();
+    ctx.textAlign = 'right';
+    ctx.globalAlpha = low ? 0.35 + 0.65 * Math.abs(Math.sin(elapsed * 16)) : 1;
+    ctx.fillStyle = mult >= 4 ? '#ff4d5e' : (mult >= 3 ? '#ff8c42' : COLOR.gold);
+    ctx.font = `700 26px ${FONT}`;
+    ctx.fillText('×' + mult, W - 20, 100);
+
+    // 剩余时间条
+    ctx.globalAlpha = 1;
+    const bw = 54;
+    const bx = W - 20 - bw;
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.14)';
+    ctx.fillRect(bx, 134, bw, 3);
+    ctx.fillStyle = mult >= 4 ? '#ff4d5e' : (mult >= 3 ? '#ff8c42' : COLOR.gold);
+    ctx.fillRect(bx, 134, bw * (comboTimer / COMBO_WINDOW), 3);
+    ctx.restore();
+  }
+
+  if (muted) {
+    ctx.textAlign = 'left';
+    ctx.fillStyle = 'rgba(139, 152, 169, 0.7)';
+    ctx.font = `600 12px ${FONT}`;
+    ctx.fillText('已静音（M 开启）', 20, H - 14);
+  }
+}
+
+function drawBanner(b) {
+  const a = b.t < 0.25 ? b.t / 0.25 : Math.min(1, (b.life - b.t) / 0.4);
+  ctx.save();
+  ctx.globalAlpha = Math.max(0, a);
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = `700 15px ${FONT}`;
+  const w = ctx.measureText(b.text).width + 34;
+  ctx.fillStyle = 'rgba(12, 17, 23, 0.85)';
+  roundRect(W / 2 - w / 2, 152, w, 36, 18);
+  ctx.fill();
+  ctx.fillStyle = b.color;
+  ctx.fillText(b.text, W / 2, 171);
+  ctx.restore();
+}
+
+// 自动缩字号，保证一行字不会超出画面（窄屏手机很重要）
+function fitText(text, x, y, size, weight, color) {
+  const maxW = W - 28;
+  let s = size;
+  ctx.font = `${weight} ${s}px ${FONT}`;
+  const w = ctx.measureText(text).width;
+  if (w > maxW) {
+    s = Math.max(9, (s * maxW) / w);
+    ctx.font = `${weight} ${s}px ${FONT}`;
+  }
+  ctx.fillStyle = color;
+  ctx.fillText(text, x, y);
+}
+
+function overlay(title, lines, hint) {
+  ctx.fillStyle = 'rgba(9, 13, 18, 0.78)';
+  ctx.fillRect(0, 0, W, H);
+
+  const cx = W / 2;
+  const cy = H / 2;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+
+  fitText(title, cx, cy - 124, 32, 700, COLOR.text);
+  lines.forEach((line, i) => fitText(line, cx, cy - 82 + i * 18, 14, 500, COLOR.dim));
+
+  if (hint) fitText(hint, cx, cy + 104, 14, 600, COLOR.player);
+}
+
+// ---------------- 12.5 武器升级界面 ----------------
+function advanceUpgradeSchedule() {
+  upgradeGap += CFG.upgradeStep;
+  nextUpgradeAt = elapsed + upgradeGap;
+}
+
+function openUpgrade() {
+  const available = UPGRADE_ORDER.filter((k) => upgrades[k] < UPGRADES[k].max);
+
+  // 全部满级：弹一次提示，之后不再打断游戏
+  if (available.length === 0) {
+    advanceUpgradeSchedule();
+    if (!maxedNotified) {
+      maxedNotified = true;
+      upgradeOptions = [];
+      banner = null;
+      phase = state.UPGRADE;
+      pointerDown = false;
+      pointerX = null;
+      pointerY = null;
+      activePointerId = null;
+      SFX.levelUp();
+    }
+    return;
+  }
+
+  // 升满的模块也会进入候选，但保证至少有一张还能升级的卡
+  const n = Math.min(UPGRADE_ORDER.length, 1 + Math.floor(Math.random() * 3));
+  const shuffled = UPGRADE_ORDER.slice();
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const tmp = shuffled[i];
+    shuffled[i] = shuffled[j];
+    shuffled[j] = tmp;
+  }
+
+  const options = shuffled.slice(0, n);
+  if (!options.some((k) => upgrades[k] < UPGRADES[k].max)) {
+    const pick = available[Math.floor(Math.random() * available.length)];
+    options[Math.floor(Math.random() * options.length)] = pick;
+  }
+  upgradeOptions = options;
+
+  advanceUpgradeSchedule();
+  phase = state.UPGRADE;
+  pointerDown = false;
+  pointerX = null;
+  pointerY = null;
+  activePointerId = null;
+  SFX.levelUp();
+}
+
+function chooseUpgrade(key) {
+  if (phase !== state.UPGRADE) return;
+  const u = UPGRADES[key];
+  if (!u) return;
+  if (upgrades[key] >= u.max) {                       // 满级的卡片给出提示
+    banner = { text: `${u.name} 已满级`, color: COLOR.dim, t: 0, life: 1.6 };
+    SFX.clink();
+    return;
+  }
+  if (upgradeOptions.indexOf(key) < 0) return;       // 不在本次给出的卡里
+
+  upgrades[key] += 1;
+  phase = state.PLAYING;
+  lastTs = 0;                                        // 别把选卡的时间算进 dt
+
+  if (u.special) {
+    const lv = upgrades[key];
+    const s = SPECIALS[key];
+    const pct = Math.round(s.chance[lv - 1] * 100);
+    let text;
+    if (s.heal) {
+      text = lv === 1
+        ? `${u.name} 解锁！触发 ${pct}%`
+        : `${u.name} 升到 Lv${lv}！触发 ${pct}%`;
+    } else {
+      text = lv === 1
+        ? `${u.name} 解锁！伤害 ${s.damage}`
+        : `${u.name} 升到 Lv${lv}！触发 ${pct}%`;
+    }
+    banner = { text, color: s.color, t: 0, life: 1.8 };
+  } else {
+    banner = { text: `${u.name} 升到 Lv${upgrades[key]}！`, color: COLOR.player, t: 0, life: 1.6 };
+  }
+  SFX.upgrade();
+}
+
+function cardRects() {
+  const n = upgradeOptions.length;
+  const w = Math.min(W - 40, 380);
+  const h = 78;
+  const gap = 12;
+  const total = n * h + Math.max(0, n - 1) * gap;
+  const x = (W - w) / 2;
+  const y0 = H / 2 - total / 2 + 26;
+  return upgradeOptions.map((key, i) => ({ key, x, y: y0 + i * (h + gap), w, h }));
+}
+
+function effectText(key) {
+  const u = UPGRADES[key];
+  const lv = upgrades[key];
+  if (u.special) {
+    const s = SPECIALS[key];
+    const idx = Math.min(lv, s.chance.length - 1);
+    const p = Math.round(s.chance[idx] * 100);
+    if (lv >= u.max) return `${s.desc} · 触发 ${p}%`;
+    if (lv === 0) return `${s.desc} · 触发 ${p}%`;
+    const next = Math.round(s.chance[idx] * 100);
+    return `触发 ${Math.round(s.chance[lv - 1] * 100)}% → ${next}%`;
+  }
+  if (lv >= u.max) return '已满级';
+  const cur = u.values[lv - 1];
+  const next = u.values[lv];
+  if (key === 'rate') return `间隔 ${cur.toFixed(3)}s → ${next.toFixed(3)}s`;
+  if (key === 'shot') return `弹数 ${cur} → ${next}`;
+  return `移速 ${cur} → ${next}`;
+}
+
+function drawUpgrade() {
+  ctx.fillStyle = 'rgba(9, 13, 18, 0.84)';
+  ctx.fillRect(0, 0, W, H);
+
+  // 全部满级：不再给卡，只提示一次
+  if (upgradeOptions.length === 0) {
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = COLOR.player;
+    ctx.font = `700 12px ${FONT}`;
+    ctx.fillText('W E A P O N   M A X E D', W / 2, H / 2 - 86);
+    ctx.fillStyle = COLOR.text;
+    ctx.font = `700 34px ${FONT}`;
+    ctx.fillText('武器已满级', W / 2, H / 2 - 30);
+    ctx.fillStyle = COLOR.dim;
+    ctx.font = `500 14px ${FONT}`;
+    ctx.fillText('所有武器都升到最高等级了', W / 2, H / 2 + 20);
+    ctx.fillStyle = COLOR.player;
+    ctx.font = `600 14px ${FONT}`;
+    ctx.fillText('按空格 / 点击继续', W / 2, H / 2 + 72);
+    return;
+  }
+
+  const rects = cardRects();
+  const top = rects[0].y;
+
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = COLOR.player;
+  ctx.font = `700 12px ${FONT}`;
+  ctx.fillText('W E A P O N   U P G R A D E', W / 2, top - 74);
+
+  ctx.fillStyle = COLOR.text;
+  ctx.font = `700 28px ${FONT}`;
+  ctx.fillText('武器升级', W / 2, top - 44);
+
+  ctx.fillStyle = COLOR.dim;
+  ctx.font = `500 12px ${FONT}`;
+  fitText('按 ' + upgradeOptions.map((_, i) => i + 1).join(' / ') + ' 或直接点卡片 · 灰色为已满级', W / 2, top - 16, 12, 500, COLOR.dim);
+
+  for (const r of rects) {
+    const u = UPGRADES[r.key];
+    const lv = upgrades[r.key];
+    const maxed = lv >= u.max;
+    const accent = u.special ? SPECIALS[r.key].color : COLOR.player;
+
+    ctx.fillStyle = maxed ? 'rgba(255, 255, 255, 0.035)' : 'rgba(55, 224, 194, 0.08)';
+    roundRect(r.x, r.y, r.w, r.h, 14);
+    ctx.fill();
+    ctx.strokeStyle = maxed ? 'rgba(255, 255, 255, 0.10)' : accent;
+    ctx.lineWidth = 1.5;
+    roundRect(r.x, r.y, r.w, r.h, 14);
+    ctx.stroke();
+
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+
+    ctx.fillStyle = maxed ? COLOR.dim : COLOR.text;
+    ctx.font = `700 19px ${FONT}`;
+    ctx.fillText(u.name, r.x + 22, r.y + 28);
+
+    ctx.fillStyle = maxed ? 'rgba(139, 152, 169, 0.7)' : accent;
+    ctx.font = `600 12px ${FONT}`;
+    ctx.fillText(maxed ? '已满级' : (u.special ? (lv === 0 ? '解锁 Lv1' : `Lv ${lv} → ${lv + 1}`) : `Lv ${lv} → ${lv + 1}`), r.x + 22, r.y + 55);
+
+    ctx.textAlign = 'right';
+    ctx.fillStyle = maxed ? 'rgba(139, 152, 169, 0.5)' : 'rgba(232, 238, 247, 0.72)';
+    ctx.font = `500 13px ${FONT}`;
+    ctx.fillText(effectText(r.key), r.x + r.w - 22, r.y + 30);
+
+    ctx.fillStyle = maxed ? 'rgba(139, 152, 169, 0.4)' : accent;
+    ctx.font = `700 12px ${FONT}`;
+    ctx.fillText('[ ' + (upgradeOptions.indexOf(r.key) + 1) + ' ]', r.x + r.w - 22, r.y + 56);
+  }
+
+  // 当前已满级的模块列表（即使这次没有随机到，也能看到）
+  const maxedNames = UPGRADE_ORDER
+    .filter((k) => upgrades[k] >= UPGRADES[k].max)
+    .map((k) => UPGRADES[k].name);
+  if (maxedNames.length) {
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = 'rgba(139, 152, 169, 0.78)';
+    ctx.font = `500 11px ${FONT}`;
+    ctx.fillText('已满级：' + maxedNames.join(' / '), W / 2, H - 24);
+  }
+}
+
+// ---------------- 13. 主循环 ----------------
+let lastTs = 0;
+
+function frame(ts) {
+  if (!lastTs) lastTs = ts;
+  let dt = (ts - lastTs) / 1000;
+  lastTs = ts;
+  dt = Math.min(dt, 1 / 30);   // 切标签页回来别一帧穿墙
+
+  update(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+
+// ---------------- 14. 启动 ----------------
+layout();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
